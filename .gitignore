@@ -1,0 +1,10 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+.wrangler/
+.cloudflare/
+
+# Python cache
+__pycache__/
+*.pyc

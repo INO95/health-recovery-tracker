@@ -65,11 +65,23 @@ a {
 }
 
 input[type="text"],
-input[type="file"] {
+input[type="file"],
+input[type="number"],
+input[type="date"],
+select {
   width: 100%;
   padding: 10px;
   border: 1px solid #cbd5e1;
   border-radius: 8px;
+}
+
+textarea {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 button {
@@ -115,6 +127,30 @@ button:disabled {
   justify-content: space-between;
   align-items: center;
   gap: 10px;
+}
+
+.controls {
+  margin-bottom: 12px;
+}
+
+.editor-section {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 12px;
+  background: #f8fafc;
+}
+
+.editor-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.exercise-editor {
+  border-top: 1px dashed #cbd5e1;
+  margin-top: 10px;
+  padding-top: 10px;
 }
 
 .session-list {
@@ -250,6 +286,10 @@ td {
   }
 
   .session-link {
+    grid-template-columns: 1fr;
+  }
+
+  .editor-grid {
     grid-template-columns: 1fr;
   }
 }
