@@ -4,7 +4,26 @@ node_modules/
 # Build outputs
 .wrangler/
 .cloudflare/
+frontend/dist/
 
-# Python cache
+# Python
+backend/.venv/
+backend/.pytest_cache/
+backend/build/
+backend/health_v2_backend.egg-info/
+backend/data/
 __pycache__/
 *.pyc
+
+# Local databases
+backend/health_v2.db
+*.db
+*.sqlite
+
+# Environment
+.env
+.env.local
+
+# OS / logs
+.DS_Store
+*.log

@@ -38,34 +38,101 @@ function sanitizeFilename(filename: string): string {
   return filename.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
-async function ensureUserSettingsTable(env: Env): Promise<void> {
-  await env.DB.prepare(
-    `CREATE TABLE IF NOT EXISTS user_settings (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )`
-  ).run();
+function isMissingTableError(error: unknown, tableName: string): boolean {
+  const text = error instanceof Error ? error.message : String(error ?? "");
+  return text.includes(`no such table: ${tableName}`) || text.includes(`no such table ${tableName}`);
+}
+
+function buildInClausePlaceholders(count: number): string {
+  return Array.from({ length: count }, () => "?").join(",");
+}
+
+type SessionSetRow = {
+  id: string;
+  exercise_id: string;
+  set_index: number;
+  weight_kg: number | null;
+  reps: number;
+};
+
+type CloneSetRow = {
+  exercise_id: string;
+  set_index: number;
+  weight_kg: number | null;
+  reps: number;
+};
+
+function groupSetsByExercise<T extends { exercise_id: string }>(rows: T[]): Map<string, T[]> {
+  const grouped = new Map<string, T[]>();
+  for (const row of rows) {
+    const current = grouped.get(row.exercise_id) ?? [];
+    current.push(row);
+    grouped.set(row.exercise_id, current);
+  }
+  return grouped;
+}
+
+async function loadSessionSets(env: Env, exerciseIds: string[]): Promise<Map<string, SessionSetRow[]>> {
+  if (exerciseIds.length === 0) {
+    return new Map<string, SessionSetRow[]>();
+  }
+  const placeholders = buildInClausePlaceholders(exerciseIds.length);
+  const rows = await env.DB
+    .prepare(
+      `SELECT id, exercise_id, set_index, weight_kg, reps
+       FROM sets
+       WHERE exercise_id IN (${placeholders})
+       ORDER BY exercise_id ASC, set_index ASC`
+    )
+    .bind(...exerciseIds)
+    .all<SessionSetRow>();
+  return groupSetsByExercise(rows.results);
+}
+
+async function loadCloneSourceSets(env: Env, exerciseIds: string[]): Promise<Map<string, CloneSetRow[]>> {
+  if (exerciseIds.length === 0) {
+    return new Map<string, CloneSetRow[]>();
+  }
+  const placeholders = buildInClausePlaceholders(exerciseIds.length);
+  const rows = await env.DB
+    .prepare(
+      `SELECT exercise_id, set_index, weight_kg, reps
+       FROM sets
+       WHERE exercise_id IN (${placeholders})
+       ORDER BY exercise_id ASC, set_index ASC`
+    )
+    .bind(...exerciseIds)
+    .all<CloneSetRow>();
+  return groupSetsByExercise(rows.results);
+}
+
+async function deleteSetsByExerciseIds(env: Env, exerciseIds: string[]): Promise<void> {
+  if (exerciseIds.length === 0) {
+    return;
+  }
+  const placeholders = buildInClausePlaceholders(exerciseIds.length);
+  await env.DB.prepare(`DELETE FROM sets WHERE exercise_id IN (${placeholders})`).bind(...exerciseIds).run();
 }
 
 async function getBodyweightSetting(env: Env): Promise<number> {
-  await ensureUserSettingsTable(env);
-  const row = await env.DB
-    .prepare("SELECT value FROM user_settings WHERE key = 'bodyweight_kg'")
-    .first<{ value: string }>();
-  if (!row) {
-    await env.DB
-      .prepare("INSERT INTO user_settings (key, value, updated_at) VALUES ('bodyweight_kg', ?1, ?2)")
-      .bind("70", nowIso())
-      .run();
-    return 70;
+  try {
+    const row = await env.DB
+      .prepare("SELECT value FROM user_settings WHERE key = 'bodyweight_kg'")
+      .first<{ value: string }>();
+    if (!row) {
+      return 70;
+    }
+    const parsed = Number(row.value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 70;
+  } catch (error) {
+    if (isMissingTableError(error, "user_settings")) {
+      return 70;
+    }
+    throw error;
   }
-  const parsed = Number(row.value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 70;
 }
 
 async function setBodyweightSetting(env: Env, value: number): Promise<number> {
-  await ensureUserSettingsTable(env);
   const normalized = Number.isFinite(value) && value > 0 ? Number(value.toFixed(2)) : 70;
   await env.DB
     .prepare(
@@ -78,33 +145,18 @@ async function setBodyweightSetting(env: Env, value: number): Promise<number> {
   return normalized;
 }
 
-async function ensureSessionStartedAtColumn(env: Env): Promise<void> {
-  const columns = await env.DB.prepare("PRAGMA table_info(sessions)").all<{ name: string }>();
-  const hasStartedAt = columns.results.some((col) => col.name === "started_at");
-  if (!hasStartedAt) {
-    await env.DB.prepare("ALTER TABLE sessions ADD COLUMN started_at TEXT").run();
-  }
-  await env.DB.prepare("UPDATE sessions SET started_at = date || 'T12:00:00.000Z' WHERE started_at IS NULL").run();
-}
-
-async function ensureAliasTable(env: Env): Promise<void> {
-  await env.DB.prepare(
-    `CREATE TABLE IF NOT EXISTS exercise_alias_overrides (
-      id TEXT PRIMARY KEY,
-      alias_raw TEXT NOT NULL,
-      alias_key TEXT NOT NULL UNIQUE,
-      canonical_name TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )`
-  ).run();
-}
-
 async function listAliasOverrides(env: Env): Promise<Array<{ id: string; alias_raw: string; alias_key: string; canonical_name: string; created_at: string }>> {
-  await ensureAliasTable(env);
-  const rows = await env.DB
-    .prepare("SELECT id, alias_raw, alias_key, canonical_name, created_at FROM exercise_alias_overrides ORDER BY created_at DESC")
-    .all<{ id: string; alias_raw: string; alias_key: string; canonical_name: string; created_at: string }>();
-  return rows.results;
+  try {
+    const rows = await env.DB
+      .prepare("SELECT id, alias_raw, alias_key, canonical_name, created_at FROM exercise_alias_overrides ORDER BY created_at DESC")
+      .all<{ id: string; alias_raw: string; alias_key: string; canonical_name: string; created_at: string }>();
+    return rows.results;
+  } catch (error) {
+    if (isMissingTableError(error, "exercise_alias_overrides")) {
+      return [];
+    }
+    throw error;
+  }
 }
 
 function applyAliasOverrides(
@@ -124,7 +176,6 @@ function applyAliasOverrides(
 }
 
 async function createUpload(req: Request, env: Env): Promise<Response> {
-  await ensureSessionStartedAtColumn(env);
   const formData = await req.formData();
   const file = formData.get("file");
   const parserVersion = String(formData.get("parser_version") || "cf-parser-v1");
@@ -245,7 +296,6 @@ async function createUpload(req: Request, env: Env): Promise<Response> {
 }
 
 async function listSessions(url: URL, env: Env): Promise<Response> {
-  await ensureSessionStartedAtColumn(env);
   const fromDate = url.searchParams.get("from");
   const toDate = url.searchParams.get("to");
   const limit = Number.parseInt(url.searchParams.get("limit") || "50", 10);
@@ -278,7 +328,6 @@ async function listSessions(url: URL, env: Env): Promise<Response> {
 }
 
 async function getSessionDetail(sessionId: string, env: Env): Promise<Response> {
-  await ensureSessionStartedAtColumn(env);
   const sessionRow = await env.DB.prepare(
     "SELECT id, date, started_at, calories_kcal, duration_min, volume_kg, upload_id FROM sessions WHERE id = ?1"
   )
@@ -295,27 +344,20 @@ async function getSessionDetail(sessionId: string, env: Env): Promise<Response> 
     .bind(sessionId)
     .all<{ id: string; raw_name: string; order_index: number }>();
 
-  const exercises = [];
-  for (const exercise of exerciseRows.results) {
-    const sets = await env.DB.prepare(
-      "SELECT id, set_index, weight_kg, reps FROM sets WHERE exercise_id = ?1 ORDER BY set_index ASC"
-    )
-      .bind(exercise.id)
-      .all<Record<string, unknown>>();
+  const exerciseIds = exerciseRows.results.map((exercise) => exercise.id);
+  const setsByExerciseId = await loadSessionSets(env, exerciseIds);
 
-    exercises.push({
-      id: exercise.id,
-      raw_name: exercise.raw_name,
-      order_index: exercise.order_index,
-      sets: sets.results,
-    });
-  }
+  const exercises = exerciseRows.results.map((exercise) => ({
+    id: exercise.id,
+    raw_name: exercise.raw_name,
+    order_index: exercise.order_index,
+    sets: setsByExerciseId.get(exercise.id) ?? [],
+  }));
 
   return json({ ...sessionRow, exercises });
 }
 
 async function updateSession(req: Request, sessionId: string, env: Env): Promise<Response> {
-  await ensureSessionStartedAtColumn(env);
   const existing = await env.DB.prepare("SELECT id FROM sessions WHERE id = ?1").bind(sessionId).first<{ id: string }>();
   if (!existing) {
     return errorResponse(404, "session_not_found");
@@ -342,9 +384,7 @@ async function updateSession(req: Request, sessionId: string, env: Env): Promise
     .run();
 
   const existingExerciseRows = await env.DB.prepare("SELECT id FROM exercises WHERE session_id = ?1").bind(sessionId).all<{ id: string }>();
-  for (const row of existingExerciseRows.results) {
-    await env.DB.prepare("DELETE FROM sets WHERE exercise_id = ?1").bind(row.id).run();
-  }
+  await deleteSetsByExerciseIds(env, existingExerciseRows.results.map((row) => row.id));
   await env.DB.prepare("DELETE FROM exercises WHERE session_id = ?1").bind(sessionId).run();
 
   for (const exercise of payload.exercises) {
@@ -369,9 +409,7 @@ async function deleteSession(sessionId: string, env: Env): Promise<Response> {
   }
 
   const exerciseRows = await env.DB.prepare("SELECT id FROM exercises WHERE session_id = ?1").bind(sessionId).all<{ id: string }>();
-  for (const row of exerciseRows.results) {
-    await env.DB.prepare("DELETE FROM sets WHERE exercise_id = ?1").bind(row.id).run();
-  }
+  await deleteSetsByExerciseIds(env, exerciseRows.results.map((row) => row.id));
   await env.DB.prepare("DELETE FROM exercises WHERE session_id = ?1").bind(sessionId).run();
   await env.DB.prepare("DELETE FROM sessions WHERE id = ?1").bind(sessionId).run();
   return json({ ok: true, deleted_session_id: sessionId });
@@ -384,21 +422,19 @@ async function resetSessions(env: Env): Promise<Response> {
   const sessionIds = nonSeedSessions.results.map((row) => row.id);
 
   if (sessionIds.length > 0) {
-    const placeholders = sessionIds.map(() => "?").join(",");
+    const placeholders = buildInClausePlaceholders(sessionIds.length);
     const exerciseRows = await env.DB
       .prepare(`SELECT id FROM exercises WHERE session_id IN (${placeholders})`)
       .bind(...sessionIds)
       .all<{ id: string }>();
-    for (const ex of exerciseRows.results) {
-      await env.DB.prepare("DELETE FROM sets WHERE exercise_id = ?1").bind(ex.id).run();
-    }
+    await deleteSetsByExerciseIds(env, exerciseRows.results.map((ex) => ex.id));
     await env.DB.prepare(`DELETE FROM exercises WHERE session_id IN (${placeholders})`).bind(...sessionIds).run();
     await env.DB.prepare(`DELETE FROM sessions WHERE id IN (${placeholders})`).bind(...sessionIds).run();
   }
 
   const uploadIds = nonSeedSessions.results.map((row) => row.upload_id).filter((v): v is string => Boolean(v));
   if (uploadIds.length > 0) {
-    const placeholders = uploadIds.map(() => "?").join(",");
+    const placeholders = buildInClausePlaceholders(uploadIds.length);
     await env.DB.prepare(`DELETE FROM uploads WHERE id IN (${placeholders})`).bind(...uploadIds).run();
   }
 
@@ -406,7 +442,6 @@ async function resetSessions(env: Env): Promise<Response> {
 }
 
 async function cloneSession(req: Request, sessionId: string, env: Env): Promise<Response> {
-  await ensureSessionStartedAtColumn(env);
   const source = await env.DB
     .prepare("SELECT id, date, started_at, calories_kcal, duration_min, volume_kg FROM sessions WHERE id = ?1")
     .bind(sessionId)
@@ -438,6 +473,8 @@ async function cloneSession(req: Request, sessionId: string, env: Env): Promise<
     .prepare("SELECT id, raw_name, order_index FROM exercises WHERE session_id = ?1 ORDER BY order_index ASC")
     .bind(sessionId)
     .all<{ id: string; raw_name: string; order_index: number }>();
+  const sourceExerciseIds = sourceExercises.results.map((exercise) => exercise.id);
+  const sourceSetsByExerciseId = await loadCloneSourceSets(env, sourceExerciseIds);
 
   for (const sourceExercise of sourceExercises.results) {
     const newExerciseId = crypto.randomUUID();
@@ -445,11 +482,8 @@ async function cloneSession(req: Request, sessionId: string, env: Env): Promise<
       .prepare("INSERT INTO exercises (id, session_id, raw_name, order_index) VALUES (?1, ?2, ?3, ?4)")
       .bind(newExerciseId, newSessionId, sourceExercise.raw_name, sourceExercise.order_index)
       .run();
-    const sets = await env.DB
-      .prepare("SELECT set_index, weight_kg, reps FROM sets WHERE exercise_id = ?1 ORDER BY set_index ASC")
-      .bind(sourceExercise.id)
-      .all<{ set_index: number; weight_kg: number | null; reps: number }>();
-    for (const setRow of sets.results) {
+    const sets = sourceSetsByExerciseId.get(sourceExercise.id) ?? [];
+    for (const setRow of sets) {
       await env.DB
         .prepare("INSERT INTO sets (id, exercise_id, set_index, weight_kg, reps) VALUES (?1, ?2, ?3, ?4, ?5)")
         .bind(crypto.randomUUID(), newExerciseId, setRow.set_index, setRow.weight_kg, setRow.reps)
@@ -474,29 +508,40 @@ async function createAliasOverride(req: Request, env: Env): Promise<Response> {
     return errorResponse(400, "alias_and_canonical_required");
   }
 
-  await ensureAliasTable(env);
   const aliasKey = normalizeNameKey(aliasRaw);
   const id = crypto.randomUUID();
-  await env.DB
-    .prepare(
-      `INSERT INTO exercise_alias_overrides (id, alias_raw, alias_key, canonical_name, created_at)
-       VALUES (?1, ?2, ?3, ?4, ?5)
-       ON CONFLICT(alias_key) DO UPDATE SET canonical_name = excluded.canonical_name, alias_raw = excluded.alias_raw`
-    )
-    .bind(id, aliasRaw, aliasKey, canonicalName, nowIso())
-    .run();
+  try {
+    await env.DB
+      .prepare(
+        `INSERT INTO exercise_alias_overrides (id, alias_raw, alias_key, canonical_name, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(alias_key) DO UPDATE SET canonical_name = excluded.canonical_name, alias_raw = excluded.alias_raw`
+      )
+      .bind(id, aliasRaw, aliasKey, canonicalName, nowIso())
+      .run();
+  } catch (error) {
+    if (isMissingTableError(error, "exercise_alias_overrides")) {
+      return errorResponse(500, "schema_not_ready");
+    }
+    throw error;
+  }
 
   return json({ ok: true, alias_raw: aliasRaw, alias_key: aliasKey, canonical_name: canonicalName });
 }
 
 async function deleteAliasOverride(aliasId: string, env: Env): Promise<Response> {
-  await ensureAliasTable(env);
-  await env.DB.prepare("DELETE FROM exercise_alias_overrides WHERE id = ?1").bind(aliasId).run();
+  try {
+    await env.DB.prepare("DELETE FROM exercise_alias_overrides WHERE id = ?1").bind(aliasId).run();
+  } catch (error) {
+    if (isMissingTableError(error, "exercise_alias_overrides")) {
+      return errorResponse(500, "schema_not_ready");
+    }
+    throw error;
+  }
   return json({ ok: true, deleted_alias_id: aliasId });
 }
 
 async function getRecovery(url: URL, env: Env): Promise<Response> {
-  await ensureSessionStartedAtColumn(env);
   const days = Number.parseInt(url.searchParams.get("days") || "7", 10);
   const fromDate = url.searchParams.get("from");
   const toDate = url.searchParams.get("to");
@@ -538,7 +583,15 @@ async function putBodyweight(req: Request, env: Env): Promise<Response> {
   if (!Number.isFinite(value) || value < 30 || value > 250) {
     return errorResponse(400, "invalid_bodyweight_kg");
   }
-  const saved = await setBodyweightSetting(env, value);
+  let saved: number;
+  try {
+    saved = await setBodyweightSetting(env, value);
+  } catch (error) {
+    if (isMissingTableError(error, "user_settings")) {
+      return errorResponse(500, "schema_not_ready");
+    }
+    throw error;
+  }
   return json({ ok: true, bodyweight_kg: saved });
 }
 
@@ -577,7 +630,14 @@ async function putRecoverySettings(req: Request, env: Env): Promise<Response> {
     if (!Number.isFinite(restHours) || restHours <= 0 || restHours > 240) {
       return errorResponse(400, `invalid_rest_hours:${muscleCode}`);
     }
-    await updateRecoverySetting(env.DB, muscleCode, restHours);
+    try {
+      await updateRecoverySetting(env.DB, muscleCode, restHours);
+    } catch (error) {
+      if (isMissingTableError(error, "recovery_settings")) {
+        return errorResponse(500, "schema_not_ready");
+      }
+      throw error;
+    }
   }
 
   const resolved = await listRecoverySettings(env.DB, Array.from(knownCodes));
@@ -604,7 +664,6 @@ async function normalizeOcr(req: Request, env: Env): Promise<Response> {
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
-    await ensureSessionStartedAtColumn(env);
     const url = new URL(req.url);
 
     if (req.method === "OPTIONS") {

@@ -32,6 +32,7 @@ npx wrangler d1 create health-v2-db
 
 ```bash
 npx wrangler d1 execute health-v2-db --remote --file=./migrations/0001_init.sql
+npx wrangler d1 execute health-v2-db --remote --file=./migrations/0002_runtime_tables.sql
 ```
 
 R2 생성:
