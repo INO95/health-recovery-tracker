@@ -1,8 +1,14 @@
 # Cloudflare API (무료 배포용)
 
-이 디렉토리는 기존 FastAPI 백엔드를 Cloudflare Workers + D1 + R2로 대체하기 위한 런타임입니다.
+기존 FastAPI 백엔드를 Cloudflare Workers + D1 + R2로 대체한 런타임입니다.
 
-## 1) 준비
+## 빠른 시작 (로컬 개발)
+
+### 1) 사전 요구사항
+
+- Node.js 20+
+- npm 10+
+- Cloudflare 계정 + Wrangler 로그인
 
 ```bash
 cd cloudflare-api
@@ -10,41 +16,72 @@ npm install
 npx wrangler whoami
 ```
 
-## 2) 리소스 생성
+`whoami`가 실패하면 먼저 로그인합니다.
+
+```bash
+npx wrangler login
+```
+
+### 2) 로컬 DB 초기화 (최초 1회)
+
+로컬 개발에서는 D1 로컬 DB(Miniflare)를 사용합니다.
+
+```bash
+npx wrangler d1 execute health-v2-db --local --file=./migrations/0001_init.sql
+npx wrangler d1 execute health-v2-db --local --file=./migrations/0002_runtime_tables.sql
+```
+
+### 3) 로컬 서버 실행
+
+```bash
+npm run dev
+```
+
+기본적으로 Wrangler가 로컬 Worker를 띄우며, 터미널에 출력된 주소(보통 `http://127.0.0.1:8787`)로 접근할 수 있습니다.
+
+### 4) 동작 확인
+
+```bash
+curl http://127.0.0.1:8787/api/health
+curl "http://127.0.0.1:8787/api/sessions?limit=5"
+```
+
+## Cloudflare 리소스 준비 (배포 전 1회)
+
+아래는 실제 Cloudflare 리소스(D1/R2)가 아직 없을 때만 실행합니다.
 
 ```bash
 npx wrangler d1 create health-v2-db
 npx wrangler r2 bucket create health-v2-uploads
 ```
 
-`wrangler.toml`의 `database_id`를 실제 값으로 교체합니다.
+`wrangler.toml`의 `database_id`를 생성된 실제 D1 ID로 갱신합니다.
 
-## 3) 마이그레이션
+원격 DB에도 스키마를 반영하려면:
 
 ```bash
 npx wrangler d1 execute health-v2-db --remote --file=./migrations/0001_init.sql
+npx wrangler d1 execute health-v2-db --remote --file=./migrations/0002_runtime_tables.sql
 ```
 
-## 4) 로컬 실행
-
-```bash
-npm run dev
-```
-
-## 5) 배포
+## 배포
 
 ```bash
 npm run deploy
+```
+
+## 테스트
+
+```bash
+npm test
 ```
 
 ## API
 
 - `GET /api/health`
 - `POST /api/uploads` (`multipart/form-data`)
-  - `file` (required)
-  - `ocr_text_raw` (required for parsed result)
-  - `ocr_engine_version` (optional)
-  - `parser_version` (optional)
+- 필수 필드: `file`, `ocr_text_raw`
+- 선택 필드: `ocr_engine_version`, `parser_version`
 - `GET /api/sessions`
 - `GET /api/sessions/:id`
 - `GET /api/recovery`

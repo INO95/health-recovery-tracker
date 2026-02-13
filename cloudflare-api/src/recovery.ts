@@ -27,6 +27,11 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function isMissingTableError(error: unknown, tableName: string): boolean {
+  const text = error instanceof Error ? error.message : String(error ?? "");
+  return text.includes(`no such table: ${tableName}`) || text.includes(`no such table ${tableName}`);
+}
+
 function statusColor(recovery: number): string {
   if (recovery >= 70) return "green";
   if (recovery >= 40) return "yellow";
@@ -73,45 +78,40 @@ export function defaultRestHoursForMuscle(code: string): number {
   return 36;
 }
 
-export async function ensureRecoverySettingsTable(db: D1Database): Promise<void> {
-  await db.prepare(
-    `CREATE TABLE IF NOT EXISTS recovery_settings (
-      muscle_code TEXT PRIMARY KEY,
-      rest_hours REAL NOT NULL,
-      updated_at TEXT NOT NULL
-    )`
-  ).run();
-}
-
 export async function listRecoverySettings(
   db: D1Database,
   muscleCodes: string[] = []
 ): Promise<Record<string, number>> {
-  await ensureRecoverySettingsTable(db);
+  const requestedCodes = new Set<string>([...Object.keys(DEFAULT_REST_HOURS_BY_MUSCLE), ...muscleCodes]);
+  const resolved: Record<string, number> = {};
+  let rows: Array<{ muscle_code: string; rest_hours: number }> = [];
 
-  const allCodes = new Set<string>([...Object.keys(DEFAULT_REST_HOURS_BY_MUSCLE), ...muscleCodes]);
-  for (const code of allCodes) {
-    await db
-      .prepare("INSERT OR IGNORE INTO recovery_settings (muscle_code, rest_hours, updated_at) VALUES (?1, ?2, ?3)")
-      .bind(code, defaultRestHoursForMuscle(code), nowIso())
-      .run();
+  try {
+    const queryRows = await db
+      .prepare("SELECT muscle_code, rest_hours FROM recovery_settings")
+      .all<{ muscle_code: string; rest_hours: number }>();
+    rows = queryRows.results;
+  } catch (error) {
+    if (!isMissingTableError(error, "recovery_settings")) {
+      throw error;
+    }
   }
 
-  const rows = await db
-    .prepare("SELECT muscle_code, rest_hours FROM recovery_settings")
-    .all<{ muscle_code: string; rest_hours: number }>();
-
-  const resolved: Record<string, number> = {};
-  for (const row of rows.results) {
+  for (const row of rows) {
     const value = Number(row.rest_hours);
     resolved[row.muscle_code] = Number.isFinite(value) && value > 0 ? value : defaultRestHoursForMuscle(row.muscle_code);
+  }
+
+  for (const code of requestedCodes) {
+    if (!(code in resolved)) {
+      resolved[code] = defaultRestHoursForMuscle(code);
+    }
   }
 
   return resolved;
 }
 
 export async function updateRecoverySetting(db: D1Database, muscleCode: string, restHours: number): Promise<void> {
-  await ensureRecoverySettingsTable(db);
   await db
     .prepare(
       `INSERT INTO recovery_settings (muscle_code, rest_hours, updated_at)
