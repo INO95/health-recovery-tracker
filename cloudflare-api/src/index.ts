@@ -670,6 +670,14 @@ export default {
       return new Response(null, { status: 204, headers: JSON_HEADERS });
     }
 
+    if (req.method === "GET" && url.pathname === "/") {
+      return json({
+        service: "health-v2-api",
+        status: "ok",
+        health: "/api/health",
+      });
+    }
+
     if (req.method === "GET" && url.pathname === "/api/health") {
       return json({ status: "ok" });
     }
