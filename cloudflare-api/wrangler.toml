@@ -13,3 +13,10 @@ database_id = "82401b3e-7122-4ff1-8b92-6b1577071a26"
 [[r2_buckets]]
 binding = "UPLOADS"
 bucket_name = "health-v2-uploads"
+
+[vars]
+RATE_LIMIT_ENABLED = "1"
+RATE_LIMIT_MAX_PER_MINUTE = "120"
+RATE_LIMIT_WINDOW_SECONDS = "60"
+RATE_LIMIT_MAX_SESSIONS_READ = "100"
+RATE_LIMIT_WINDOW_SESSIONS_READ = "45"

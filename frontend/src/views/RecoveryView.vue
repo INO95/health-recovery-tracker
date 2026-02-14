@@ -2,8 +2,13 @@
   <section class="card">
     <div class="row">
       <h2>Recovery 🔋</h2>
-      <button class="secondary touch-button" :disabled="loading" @click="loadRecovery">
-        {{ loading ? "Loading..." : "Retry" }}
+      <button
+        class="secondary touch-button"
+        :disabled="loading || retryBlockedByRateLimit"
+        :title="retryButtonTooltip"
+        @click="loadRecovery"
+      >
+        {{ retryButtonLabel }}
       </button>
     </div>
 
@@ -26,6 +31,9 @@
     </section>
 
     <p v-if="loading" class="hint">회복 상태를 불러오는 중입니다...</p>
+    <p v-if="retryNotice && loading" class="hint">{{ retryNotice }}</p>
+    <p v-if="rateLimitNotice && !loading" class="hint">{{ rateLimitNotice }}</p>
+    <p v-if="retryCooldownDetail && !loading" class="hint">{{ retryCooldownDetail }}</p>
     <p v-if="errorMessage" class="error">{{ errorMessage }}</p>
 
     <div v-if="recovery" class="recovery-grid">
@@ -61,6 +69,10 @@
       class="unmapped-card"
     >
       <h3>Unmapped Exercises</h3>
+      <p class="hint">
+        아래 운동명은 근육 매핑이 없어 정확도가 낮습니다. <RouterLink to="/sessions">Sessions</RouterLink>에서 Alias
+        Override로 정규 이름을 등록하면 바로 개선됩니다.
+      </p>
       <div v-for="item in recovery.unmapped_exercises" :key="item.raw_name" class="contributor-row">
         <span class="truncate">{{ item.raw_name }}</span>
         <span class="status-badge status-yellow">{{ item.count }}</span>
@@ -82,14 +94,22 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
-import { fetchRecovery, fetchRecoverySettings, updateRecoverySettings } from "../api/client";
+import { computed, onMounted, onUnmounted, ref } from "vue";
+import { fetchRecovery, fetchRecoverySettings, getLastApiRateLimitInfo, updateRecoverySettings } from "../api/client";
 import type { RecoveryResponse } from "../types";
+import { formatClientError } from "../utils/apiError";
+import { buildRateLimitNotice, getRateLimitCooldownMs } from "../utils/rateLimit";
+import { withRetry } from "../utils/retry";
 
 const loading = ref(false);
 const errorMessage = ref("");
+const retryNotice = ref("");
+const rateLimitNotice = ref("");
 const recovery = ref<RecoveryResponse | null>(null);
 const restHoursDraft = ref<Record<string, number>>({});
+const rateLimitCooldownUntilMs = ref(0);
+const cooldownNowMs = ref(Date.now());
+let cooldownTimer: ReturnType<typeof setInterval> | null = null;
 
 const sortedMuscles = computed(() => {
   if (!recovery.value) {
@@ -107,6 +127,58 @@ const restSettingRows = computed(() =>
   }))
 );
 
+const rateLimitCooldownSec = computed(() => Math.max(0, Math.ceil((rateLimitCooldownUntilMs.value - cooldownNowMs.value) / 1000)));
+const retryBlockedByRateLimit = computed(() => rateLimitCooldownSec.value > 0);
+const retryCooldownDetail = computed(() => {
+  if (!retryBlockedByRateLimit.value) {
+    return "";
+  }
+  return `요청 한도 보호로 회복 조회가 잠시 비활성화됩니다. ${rateLimitCooldownSec.value}초 후 재시도 가능 (해제 시각: ${formatCooldownReleaseTime(rateLimitCooldownUntilMs.value)}).`;
+});
+const retryButtonLabel = computed(() => {
+  if (loading.value) {
+    return "Loading...";
+  }
+  if (retryBlockedByRateLimit.value) {
+    return `Retry (${rateLimitCooldownSec.value}s)`;
+  }
+  return "Retry";
+});
+const retryButtonTooltip = computed(() =>
+  retryBlockedByRateLimit.value ? retryCooldownDetail.value : "회복 데이터를 다시 조회합니다."
+);
+
+function ensureCooldownTicker(): void {
+  const active = rateLimitCooldownUntilMs.value > Date.now();
+  if (active && !cooldownTimer) {
+    cooldownTimer = setInterval(() => {
+      cooldownNowMs.value = Date.now();
+      if (rateLimitCooldownUntilMs.value <= cooldownNowMs.value && cooldownTimer) {
+        clearInterval(cooldownTimer);
+        cooldownTimer = null;
+      }
+    }, 500);
+    return;
+  }
+  if (!active && cooldownTimer) {
+    clearInterval(cooldownTimer);
+    cooldownTimer = null;
+  }
+}
+
+function syncRateLimitUi(pathPrefix: string): void {
+  const info = getLastApiRateLimitInfo();
+  rateLimitNotice.value = buildRateLimitNotice(info, {
+    pathPrefix,
+  });
+  const cooldownMs = getRateLimitCooldownMs(info, {
+    pathPrefix,
+  });
+  rateLimitCooldownUntilMs.value = cooldownMs > 0 ? Date.now() + cooldownMs : 0;
+  cooldownNowMs.value = Date.now();
+  ensureCooldownTicker();
+}
+
 function syncDraftFromRecovery(): void {
   if (!recovery.value) return;
   const next: Record<string, number> = {};
@@ -123,14 +195,43 @@ function formatDateTime(iso: string | null): string {
   return d.toLocaleString();
 }
 
+function formatCooldownReleaseTime(targetMs: number): string {
+  const target = new Date(targetMs);
+  if (Number.isNaN(target.getTime())) {
+    return "-";
+  }
+  const year = target.getFullYear();
+  const month = String(target.getMonth() + 1).padStart(2, "0");
+  const day = String(target.getDate()).padStart(2, "0");
+  const hours = String(target.getHours()).padStart(2, "0");
+  const minutes = String(target.getMinutes()).padStart(2, "0");
+  const seconds = String(target.getSeconds()).padStart(2, "0");
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
 async function loadRecovery(): Promise<void> {
   loading.value = true;
   errorMessage.value = "";
+  retryNotice.value = "";
+  if (retryBlockedByRateLimit.value) {
+    loading.value = false;
+    return;
+  }
   try {
-    const [recoveryPayload, settingsPayload] = await Promise.all([
-      fetchRecovery({ days: 7 }),
-      fetchRecoverySettings(),
-    ]);
+    const [recoveryPayload, settingsPayload] = await withRetry(
+      () =>
+        Promise.all([
+          fetchRecovery({ days: 7 }),
+          fetchRecoverySettings(),
+        ]),
+      {
+        retries: 2,
+        onRetry: ({ nextAttempt, maxAttempts, delayMs }) => {
+          const retryAfterSeconds = Math.max(1, Math.ceil(delayMs / 1000));
+          retryNotice.value = `회복 데이터 조회 실패로 자동 재시도합니다... (${nextAttempt}/${maxAttempts}, 약 ${retryAfterSeconds}초 후)`;
+        },
+      }
+    );
     recovery.value = recoveryPayload;
     if (!recovery.value.recovery_settings) {
       recovery.value.recovery_settings = settingsPayload.settings;
@@ -141,8 +242,12 @@ async function loadRecovery(): Promise<void> {
       }
     }
     syncDraftFromRecovery();
+    retryNotice.value = "";
+    syncRateLimitUi("/api/recovery");
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "회복 데이터 조회 중 오류가 발생했습니다.";
+    retryNotice.value = "";
+    errorMessage.value = formatClientError("회복 데이터 조회 실패", error);
+    syncRateLimitUi("/api/recovery");
   } finally {
     loading.value = false;
   }
@@ -159,7 +264,7 @@ async function saveRestSettings(): Promise<void> {
     await updateRecoverySettings(payload);
     await loadRecovery();
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "회복 설정 저장 중 오류가 발생했습니다.";
+    errorMessage.value = formatClientError("회복 설정 저장 실패", error);
   } finally {
     loading.value = false;
   }
@@ -167,5 +272,12 @@ async function saveRestSettings(): Promise<void> {
 
 onMounted(() => {
   void loadRecovery();
+});
+
+onUnmounted(() => {
+  if (cooldownTimer) {
+    clearInterval(cooldownTimer);
+    cooldownTimer = null;
+  }
 });
 </script>

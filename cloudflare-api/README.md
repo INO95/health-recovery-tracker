@@ -73,8 +73,11 @@ npm run deploy
 ## 테스트
 
 ```bash
+npm run typecheck
 npm test
 ```
+
+`npm test`에는 API 통합 테스트(`test/api-integration.test.ts`)가 포함됩니다.
 
 ## API
 

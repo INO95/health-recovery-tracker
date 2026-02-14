@@ -1,290 +1,112 @@
-# Testing & Validation Note
+# 테스트 및 검증 가이드 (Cloudflare 운영 런타임)
 
-## Overview
+## 개요
+이 문서는 현재 운영 경로에 대한 테스트 전략을 설명합니다.
 
-This document explains the testing strategy, what risks each test addresses, and the significance of real-device mobile validation.
+- API: `cloudflare-api`
+- Frontend: `frontend`
 
----
+`backend/tests`는 레거시 참고용입니다.
 
-## Test Coverage Map
+## 1) 실행 명령
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Test Coverage                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                   │
-│  │   Unit       │    │ Integration  │    │    E2E       │                   │
-│  │   Tests      │    │   Tests      │    │   Tests      │                   │
-│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘                   │
-│         │                   │                   │                           │
-│         ▼                   ▼                   ▼                           │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                   │
-│  │ Parser       │    │ Upload API   │    │ Upload →     │                   │
-│  │ Recovery     │    │ Sessions API │    │ Worker →     │                   │
-│  │ Alias lookup │    │ Recovery API │    │ Parse →      │                   │
-│  │ Date helpers │    │ Worker job   │    │ DB →         │                   │
-│  └──────────────┘    └──────────────┘    │ API →        │                   │
-│                                          │ Mobile UI    │                   │
-│                                          └──────────────┘                   │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Risk-to-Test Mapping
-
-### 1. Parser Mismatch Risk
-
-**Risk**: OCR output format changes, parser fails silently, corrupted data enters DB.
-
-**Test**: `test_parser_mismatch_safe_failure`
-
-```python
-def test_parser_handles_unexpected_format():
-    """
-    Given: OCR text in unexpected format
-    When: Parser attempts to parse
-    Then: Returns error result, does NOT raise exception
-          Status = 'error', error_message populated
-    """
-    result = parser.parse("completely unexpected format ###")
-    
-    assert result['status'] == 'error'
-    assert result['error_message'] is not None
-    assert result['sessions'] == []
-```
-
-**Why This Matters**: Prevents garbage data from entering production tables.
-
----
-
-### 2. Seed Data Contamination Risk
-
-**Risk**: Seed session (1970-01-01) appears in user queries, distorting recovery calculations.
-
-**Test**: `test_seed_session_excluded`
-
-```python
-def test_queries_exclude_seed_session():
-    """
-    Given: Seed session exists with date 1970-01-01
-    When: Querying sessions for recovery calculation
-    Then: Seed session is NOT included
-    """
-    # Setup
-    create_seed_session()
-    create_real_session(date='2026-02-08')
-    
-    # Execute
-    sessions = get_sessions_for_recovery()
-    
-    # Verify
-    dates = [s.session_date.isoformat() for s in sessions]
-    assert '1970-01-01' not in dates
-    assert '2026-02-08' in dates
-```
-
-**Why This Matters**: Ensures algorithmic correctness isn't affected by system data.
-
----
-
-### 3. Decay Calculation Risk
-
-**Risk**: Time decay formula produces nonsensical results (negative, >100%, wrong direction).
-
-**Test**: `test_decay_sanity`
-
-```python
-def test_recovery_increases_over_time():
-    """
-    Given: A workout completed at t=0
-    When: Checking recovery at t=0 vs t=48h
-    Then: Recovery at t=48h > Recovery at t=0
-    """
-    workout = create_workout(date=now())
-    
-    recovery_immediate = calculate_recovery(ref_date=now())
-    recovery_later = calculate_recovery(ref_date=now() + timedelta(hours=48))
-    
-    for muscle in ['chest', 'back', 'legs']:
-        assert recovery_later[muscle] > recovery_immediate[muscle]
-```
-
-**Test**: `test_recovery_bounds`
-
-```python
-def test_recovery_always_in_valid_range():
-    """
-    Given: Any valid input
-    Then: Recovery percentage is always 0-100
-    """
-    for scenario in [empty_data, minimal_data, extreme_data]:
-        recovery = calculate_recovery(scenario)
-        for muscle, pct in recovery.items():
-            assert 0 <= pct <= 100
-```
-
----
-
-### 4. API Hardening Risk
-
-**Risk**: Invalid input crashes API, returns 500, or leaks internal errors.
-
-**Test**: `test_api_hardening`
-
-```python
-@pytest.mark.parametrize("invalid_id", [
-    "not-a-uuid",
-    "00000000-0000-0000-0000-000000000000",  # Non-existent
-    "../etc/passwd",  # Path traversal attempt
-    "",
-])
-def test_invalid_upload_id_returns_4xx(invalid_id):
-    response = client.get(f"/api/uploads/{invalid_id}")
-    assert response.status_code in [400, 404]
-    assert "error" in response.json()
-```
-
----
-
-### 5. Worker Processing Risk
-
-**Risk**: Worker crashes, job stuck in queue, upload status never updates.
-
-**Test**: `test_worker_updates_status`
-
-```python
-def test_worker_completes_job():
-    """
-    Given: Upload in 'pending' status
-    When: Worker processes the job
-    Then: Status transitions to 'done' (or 'error')
-          Processing time is recorded
-    """
-    upload = create_upload(status='pending')
-    
-    # Simulate worker
-    worker.process_job(upload.id)
-    
-    upload.refresh()
-    assert upload.status in ['done', 'error']
-    assert upload.processed_at is not None
-```
-
----
-
-## Integration Test: Complete Flow
-
-```python
-def test_upload_to_recovery_flow():
-    """
-    E2E test: Upload → Worker → Parse → DB → Recovery API
-    """
-    # 1. Upload
-    response = client.post("/api/uploads", files={"file": workout_image})
-    assert response.status_code == 201
-    upload_id = response.json()["id"]
-    
-    # 2. Wait for worker (or trigger sync for test)
-    worker.process_pending()
-    
-    # 3. Verify session created
-    upload = client.get(f"/api/uploads/{upload_id}").json()
-    assert upload["status"] == "done"
-    
-    # 4. Check recovery reflects new data
-    recovery = client.get("/api/recovery").json()
-    # Assuming workout targeted chest
-    assert recovery["muscles"]["chest"]["recovery_pct"] < 100
-```
-
----
-
-## Mobile Validation
-
-### Why Real Device Testing?
-
-| Validation Method | What It Catches | Limitation |
-|-------------------|-----------------|------------|
-| Unit tests | Logic errors | No UI/UX issues |
-| Browser DevTools emulation | Layout issues | Not actual mobile behavior |
-| **Real iPhone Safari** | Touch events, file upload, network | Requires physical device |
-
-### Mobile-Specific Issues Caught
-
-1. **File input behavior**: `<input type="file" accept="image/*" capture="environment">` behaves differently on iOS
-2. **CORS preflight**: Some mobile browsers have stricter CORS handling
-3. **Touch targets**: Buttons too small for finger taps
-4. **Viewport scaling**: Form inputs triggering unwanted zoom
-
-### Test Checklist
-
-| # | Check | Method |
-|---|-------|--------|
-| 1 | Page loads on iPhone Safari | Manual |
-| 2 | Camera/gallery picker appears | Manual |
-| 3 | Upload progress shows | Manual observation |
-| 4 | Status updates to 'done' | Poll or refresh |
-| 5 | Session detail renders correctly | Manual |
-| 6 | Recovery colors display properly | Manual |
-| 7 | Touch targets are ≥44px | Manual |
-
-### Test Environment Setup
-
+### API 테스트 (Vitest)
 ```bash
-# Mac (same Wi-Fi as iPhone)
-# Terminal 1: Backend
-cd backend
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-
-# Terminal 2: Frontend
-cd frontend
-npm run dev -- --host 0.0.0.0
-
-# Terminal 3: Worker
-cd backend
-rq worker
-
-# iPhone Safari
-# Navigate to http://<mac-ip>:5173
+cd /Users/moltbot/Projects/health-recovery-tracker/cloudflare-api
+npm test
 ```
 
----
-
-## Test Results Summary
-
-```
-backend/tests/
-├── test_parser.py           ✅ 12 passed
-├── test_recovery.py         ✅ 8 passed
-├── test_api_uploads.py      ✅ 7 passed
-├── test_api_sessions.py     ✅ 5 passed
-├── test_api_recovery.py     ✅ 4 passed
-├── test_worker.py           ✅ 3 passed
-└── test_integration.py      ✅ 2 passed
-
-Total: 41 passed, 0 failed
+### API 타입체크
+```bash
+cd /Users/moltbot/Projects/health-recovery-tracker/cloudflare-api
+npm run typecheck
 ```
 
----
+### Frontend 타입체크
+```bash
+cd /Users/moltbot/Projects/health-recovery-tracker/frontend
+npm run typecheck
+```
 
-## What This Testing Strategy Demonstrates
+### Frontend 빌드 검증
+```bash
+cd /Users/moltbot/Projects/health-recovery-tracker/frontend
+npm run build
+```
 
-| Aspect | Evidence |
-|--------|----------|
-| **Risk awareness** | Each test maps to a specific failure mode |
-| **Layered approach** | Unit → Integration → E2E |
-| **Real-world validation** | Not just localhost/emulator |
-| **Boundary testing** | Edge cases, invalid inputs |
-| **Algorithm verification** | Mathematical properties (monotonicity, bounds) |
+## 2) 커버리지 맵 (Cloudflare API)
+| 테스트 파일 | 주요 리스크 |
+|---|---|
+| `test/parser.test.ts` | OCR 텍스트 파싱 품질, 요약/세트 추출 일관성 |
+| `test/ocr-normalize.test.ts` | 정규화 텍스트 포맷 안정성, 경고 처리 |
+| `test/upload-policy.test.ts` | `needs_review` 업로드 허용/차단 정책 |
+| `test/session-mutations.test.ts` | 세션 수정 payload 정규화, 볼륨 재계산 |
+| `test/exercise-muscles.test.ts` | 운동-근육 매핑 정확도, 맨몸운동 무게 추론 |
+| `test/recovery-model.test.ts` | 기본 회복시간 설정값 규칙 |
+| `test/recovery-timing.test.ts` | 기준시각/잔여회복시간 계산 안정성 |
+| `test/trainer-advice.test.ts` | 추천/휴식 메시지 생성 로직 |
+| `test/route-patterns.test.ts` | 동적 라우트 UUID 매칭 안정성 |
+| `test/api-integration.test.ts` | Worker 라우팅/바인딩 + D1 + multipart 업로드 + 에러 계약(`detail/code/request_id`) + `429/retry-after` + recovery 결정성 회귀 |
 
----
+## 3) 리스크별 검증 전략
+### Risk A: OCR 입력 품질 편차
+- 자동화: parser/normalize 테스트
+- 수동: Upload 화면에서 OCR 결과 편집 후 업로드 가능 여부 확인
 
-## Future Testing Enhancements
+### Risk B: 매핑 누락으로 인한 계산 왜곡
+- 자동화: exercise-muscles 테스트
+- 런타임 안전장치: `unmapped_exercises` 경고 노출
 
-1. **Load testing**: Multiple concurrent uploads
-2. **Chaos testing**: Worker crash recovery
-3. **Visual regression**: Screenshot comparison for UI
-4. **Automated mobile**: Appium or Playwright mobile
+### Risk C: 회복시간 계산의 시간축 오류
+- 자동화: recovery-timing 테스트
+- 수동: `reference_at` 변경 시 `remaining_hours` 변화 확인
+
+### Risk D: 세션 편집 후 볼륨 불일치
+- 자동화: session-mutations 테스트
+- 수동: 세션 상세 수정 후 Recovery 반영 확인
+
+### Risk E: 일시적 네트워크 오류로 조회 실패
+- 프론트 동작: `Sessions/SessionDetail/Recovery` 조회는 지수 백오프로 최대 2회 자동 재시도
+- 서버가 `Retry-After` 헤더를 보내면 해당 값(초/HTTP-date)을 재시도 대기시간 하한으로 반영
+- API는 `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window` 헤더를 내려 클라이언트/운영 관측을 지원
+- API는 `RATE_LIMIT_MAX_<SCOPE>_<READ|WRITE>`, `RATE_LIMIT_WINDOW_<SCOPE>_<READ|WRITE>` override가 있으면 버킷별 한도/윈도우를 다르게 반환
+- 프론트는 남은 한도가 임계치 이하일 때(기본 5회 또는 10%) 사전 경고 문구를 표시
+- 프론트는 남은 한도가 0에 도달하면 해당 조회 버튼에 윈도우 기반 쿨다운(초 단위)을 적용
+- 수동: API를 잠시 끊었다 복구했을 때 재시도 안내 문구 후 자동 회복되는지 확인
+
+## 4) 수동 E2E 스모크 시나리오
+1. Upload 화면에서 이미지 선택 -> OCR -> AI 정리 -> Upload
+2. Sessions 화면에서 생성된 세션 확인
+3. Session Detail에서 세트 값 수정 후 저장
+4. Recovery 화면에서 해당 부위 `fatigue/recovery/contributors` 변화 확인
+5. Sessions에서 alias override 등록 후 재업로드, unmapped 감소 확인
+
+## 5) API 계약 스모크 체크 (curl)
+```bash
+# health
+curl http://127.0.0.1:8787/api/health
+
+# sessions list
+curl "http://127.0.0.1:8787/api/sessions?limit=5"
+
+# recovery
+curl "http://127.0.0.1:8787/api/recovery?days=7"
+```
+
+## 6) 레거시 테스트 위치
+- `backend/tests/*`는 과거 FastAPI 경로 검증 자료입니다.
+- 운영 회귀 판단 기준은 `cloudflare-api/test/*` + API 타입체크 + 프론트 타입체크/빌드 결과입니다.
+
+## 7) 코드-문서 정합성 체크리스트
+문서 갱신 시 아래 파일을 기준으로 대조합니다.
+
+- API 라우팅: `cloudflare-api/src/router.ts`
+- API 오류/응답 계약: `cloudflare-api/src/http.ts`
+- 업로드/세션/설정 핸들러: `cloudflare-api/src/handlers/*`
+- 업로드/세션/회복 서비스: `cloudflare-api/src/services/*`
+- 회복 계산: `cloudflare-api/src/recovery.ts`
+- 세션 정규화: `cloudflare-api/src/session-mutations.ts`
+- 운동 매핑/맨몸 계산: `cloudflare-api/src/exercise-muscles.ts`
+- 스키마: `cloudflare-api/migrations/0001_init.sql`, `cloudflare-api/migrations/0002_runtime_tables.sql`
+
+이 체크리스트를 유지하면 문서-코드 불일치를 줄일 수 있습니다.

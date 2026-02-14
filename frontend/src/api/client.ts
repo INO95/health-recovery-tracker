@@ -1,4 +1,5 @@
 import type {
+  ApiErrorResponse,
   BodyweightResponse,
   ExerciseAliasOverride,
   OcrNormalizeResponse,
@@ -12,12 +13,103 @@ import type {
 
 const API_BASE_OVERRIDE_KEY = "health_v2_api_base_url";
 
+export type ApiRateLimitInfo = {
+  limit: number;
+  remaining: number;
+  windowSec: number;
+  status: number;
+  path: string;
+  updatedAt: number;
+};
+
+let lastApiRateLimitInfo: ApiRateLimitInfo | null = null;
+
 function normalizeBaseUrl(value: string): string {
   return value.replace(/\/+$/, "");
 }
 
+function parseNonNegativeInt(value: string | null): number | null {
+  if (!value) {
+    return null;
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return null;
+  }
+  return parsed;
+}
+
+function parseRetryAfterMs(value: string | null): number | null {
+  if (!value) {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const asSeconds = Number(trimmed);
+  if (Number.isFinite(asSeconds) && asSeconds >= 0) {
+    return Math.round(asSeconds * 1000);
+  }
+
+  const asDate = Date.parse(trimmed);
+  if (Number.isNaN(asDate)) {
+    return null;
+  }
+  return Math.max(0, asDate - Date.now());
+}
+
+function captureRateLimitInfo(path: string, response: Response): void {
+  const limit = parseNonNegativeInt(response.headers.get("x-ratelimit-limit"));
+  const remaining = parseNonNegativeInt(response.headers.get("x-ratelimit-remaining"));
+  const windowSec = parseNonNegativeInt(response.headers.get("x-ratelimit-window"));
+  if (limit == null || remaining == null || windowSec == null) {
+    return;
+  }
+
+  lastApiRateLimitInfo = {
+    limit,
+    remaining,
+    windowSec,
+    status: response.status,
+    path,
+    updatedAt: Date.now(),
+  };
+}
+
+export function getLastApiRateLimitInfo(): ApiRateLimitInfo | null {
+  return lastApiRateLimitInfo;
+}
+
+export class ApiClientError extends Error {
+  status: number;
+  detail: string;
+  code: string;
+  requestId: string | null;
+  retryAfterMs: number | null;
+
+  constructor(params: {
+    status: number;
+    detail: string;
+    code?: string;
+    requestId?: string | null;
+    retryAfterMs?: number | null;
+  }) {
+    const code = params.code || "api_error";
+    super(`[${code}] ${params.detail}`);
+    this.name = "ApiClientError";
+    this.status = params.status;
+    this.detail = params.detail;
+    this.code = code;
+    this.requestId = params.requestId ?? null;
+    this.retryAfterMs = params.retryAfterMs ?? null;
+  }
+}
+
 export function getApiBaseUrl(): string {
-  const envValue = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+  const envValue = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8787";
   if (typeof window === "undefined") {
     return normalizeBaseUrl(envValue);
   }
@@ -34,9 +126,27 @@ export function setApiBaseUrl(value: string): void {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${getApiBaseUrl()}${path}`, init);
+  captureRateLimitInfo(path, response);
   if (!response.ok) {
-    const message = await response.text();
-    throw new Error(`API ${response.status}: ${message || response.statusText}`);
+    const rawText = await response.text();
+    let parsed: ApiErrorResponse | null = null;
+    try {
+      parsed = rawText ? (JSON.parse(rawText) as ApiErrorResponse) : null;
+    } catch {
+      parsed = null;
+    }
+
+    const detail = parsed?.detail || rawText || response.statusText || "request_failed";
+    const code = parsed?.code || "request_failed";
+    const requestId = parsed?.request_id || response.headers.get("x-request-id");
+    const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+    throw new ApiClientError({
+      status: response.status,
+      detail,
+      code,
+      requestId,
+      retryAfterMs,
+    });
   }
   return (await response.json()) as T;
 }
