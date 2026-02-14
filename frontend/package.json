@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node ./node_modules/vite/bin/vite.js",
     "dev:lan": "node ./node_modules/vite/bin/vite.js --host 0.0.0.0 --port 5173",
+    "typecheck": "vue-tsc --noEmit",
     "build": "node ./node_modules/vite/bin/vite.js build",
     "preview": "node ./node_modules/vite/bin/vite.js preview --host 0.0.0.0 --port 4173",
     "deploy:pages": "wrangler pages deploy dist --project-name health-v2-frontend --commit-dirty=true"
@@ -19,6 +20,7 @@
     "@vitejs/plugin-vue": "^6.0.1",
     "typescript": "^5.8.3",
     "vite": "^7.1.0",
+    "vue-tsc": "^2.2.12",
     "wrangler": "^4.63.0"
   }
 }

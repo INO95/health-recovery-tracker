@@ -3,8 +3,13 @@
     <div class="row">
       <h2>Recent Sessions 📘</h2>
       <div class="row" style="gap:8px;">
-        <button class="secondary" :disabled="loading || resetting" @click="refresh">
-          {{ loading ? "Loading..." : "Refresh" }}
+        <button
+          class="secondary"
+          :disabled="loading || resetting || refreshBlockedByRateLimit"
+          :title="refreshButtonTooltip"
+          @click="refresh"
+        >
+          {{ refreshButtonLabel }}
         </button>
         <button class="secondary" :disabled="loading || resetting" @click="resetAll">
           {{ resetting ? "Resetting..." : "Reset All" }}
@@ -14,7 +19,10 @@
     <p class="hint">최근 5건을 기본으로 보여드려요 👀</p>
 
     <p v-if="errorMessage" class="error">{{ errorMessage }}</p>
+    <p v-if="retryNotice && loading" class="hint">{{ retryNotice }}</p>
     <p v-if="loading" class="hint">세션을 불러오는 중입니다...</p>
+    <p v-if="rateLimitNotice && !loading" class="hint">{{ rateLimitNotice }}</p>
+    <p v-if="refreshCooldownDetail && !loading" class="hint">{{ refreshCooldownDetail }}</p>
     <p v-else-if="sessions.length === 0" class="hint">표시할 세션이 없습니다.</p>
 
     <ul class="session-list">
@@ -87,22 +95,31 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
   createExerciseAlias,
   fetchBodyweight,
   deleteExerciseAlias,
   fetchExerciseAliases,
+  getLastApiRateLimitInfo,
   fetchSessions,
   resetSessions,
   updateBodyweight,
 } from "../api/client";
 import type { ExerciseAliasOverride, SessionListItem } from "../types";
+import { formatClientError } from "../utils/apiError";
+import { buildRateLimitNotice, getRateLimitCooldownMs } from "../utils/rateLimit";
+import { withRetry } from "../utils/retry";
 
 const sessions = ref<SessionListItem[]>([]);
 const loading = ref(false);
 const resetting = ref(false);
 const errorMessage = ref("");
+const retryNotice = ref("");
+const rateLimitNotice = ref("");
+const rateLimitCooldownUntilMs = ref(0);
+const cooldownNowMs = ref(Date.now());
+let cooldownTimer: ReturnType<typeof setInterval> | null = null;
 
 const aliases = ref<ExerciseAliasOverride[]>([]);
 const aliasRaw = ref("");
@@ -120,13 +137,94 @@ function formatMetric(unit: string, value: number | null): string {
   return `${value} ${unit}`;
 }
 
+function formatCooldownReleaseTime(targetMs: number): string {
+  const target = new Date(targetMs);
+  if (Number.isNaN(target.getTime())) {
+    return "-";
+  }
+  const year = target.getFullYear();
+  const month = String(target.getMonth() + 1).padStart(2, "0");
+  const day = String(target.getDate()).padStart(2, "0");
+  const hours = String(target.getHours()).padStart(2, "0");
+  const minutes = String(target.getMinutes()).padStart(2, "0");
+  const seconds = String(target.getSeconds()).padStart(2, "0");
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+const rateLimitCooldownSec = computed(() => Math.max(0, Math.ceil((rateLimitCooldownUntilMs.value - cooldownNowMs.value) / 1000)));
+const refreshBlockedByRateLimit = computed(() => rateLimitCooldownSec.value > 0);
+const refreshCooldownDetail = computed(() => {
+  if (!refreshBlockedByRateLimit.value) {
+    return "";
+  }
+  return `요청 한도 보호로 새로고침이 잠시 비활성화됩니다. ${rateLimitCooldownSec.value}초 후 재시도 가능 (해제 시각: ${formatCooldownReleaseTime(rateLimitCooldownUntilMs.value)}).`;
+});
+const refreshButtonLabel = computed(() => {
+  if (loading.value) {
+    return "Loading...";
+  }
+  if (refreshBlockedByRateLimit.value) {
+    return `Refresh (${rateLimitCooldownSec.value}s)`;
+  }
+  return "Refresh";
+});
+const refreshButtonTooltip = computed(() =>
+  refreshBlockedByRateLimit.value ? refreshCooldownDetail.value : "세션 목록을 새로고침합니다."
+);
+
+function ensureCooldownTicker(): void {
+  const active = rateLimitCooldownUntilMs.value > Date.now();
+  if (active && !cooldownTimer) {
+    cooldownTimer = setInterval(() => {
+      cooldownNowMs.value = Date.now();
+      if (rateLimitCooldownUntilMs.value <= cooldownNowMs.value && cooldownTimer) {
+        clearInterval(cooldownTimer);
+        cooldownTimer = null;
+      }
+    }, 500);
+    return;
+  }
+  if (!active && cooldownTimer) {
+    clearInterval(cooldownTimer);
+    cooldownTimer = null;
+  }
+}
+
+function syncRateLimitUi(pathPrefix: string): void {
+  const info = getLastApiRateLimitInfo();
+  rateLimitNotice.value = buildRateLimitNotice(info, {
+    pathPrefix,
+  });
+  const cooldownMs = getRateLimitCooldownMs(info, {
+    pathPrefix,
+  });
+  rateLimitCooldownUntilMs.value = cooldownMs > 0 ? Date.now() + cooldownMs : 0;
+  cooldownNowMs.value = Date.now();
+  ensureCooldownTicker();
+}
+
 async function refresh(): Promise<void> {
   loading.value = true;
   errorMessage.value = "";
+  retryNotice.value = "";
+  if (refreshBlockedByRateLimit.value) {
+    loading.value = false;
+    return;
+  }
   try {
-    sessions.value = await fetchSessions({ limit: 5 });
+    sessions.value = await withRetry(() => fetchSessions({ limit: 5 }), {
+      retries: 2,
+      onRetry: ({ nextAttempt, maxAttempts, delayMs }) => {
+        const retryAfterSeconds = Math.max(1, Math.ceil(delayMs / 1000));
+        retryNotice.value = `세션 조회 실패로 자동 재시도합니다... (${nextAttempt}/${maxAttempts}, 약 ${retryAfterSeconds}초 후)`;
+      },
+    });
+    retryNotice.value = "";
+    syncRateLimitUi("/api/sessions");
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "세션 조회 중 오류가 발생했습니다.";
+    retryNotice.value = "";
+    errorMessage.value = formatClientError("세션 조회 실패", error);
+    syncRateLimitUi("/api/sessions");
   } finally {
     loading.value = false;
   }
@@ -137,7 +235,7 @@ async function refreshAliases(): Promise<void> {
   try {
     aliases.value = await fetchExerciseAliases();
   } catch (error) {
-    aliasError.value = error instanceof Error ? error.message : "alias 조회 중 오류가 발생했습니다.";
+    aliasError.value = formatClientError("Alias 조회 실패", error);
   }
 }
 
@@ -147,7 +245,7 @@ async function refreshBodyweight(): Promise<void> {
     const payload = await fetchBodyweight();
     bodyweightKg.value = payload.bodyweight_kg;
   } catch (error) {
-    bodyweightError.value = error instanceof Error ? error.message : "체중 설정 조회 중 오류가 발생했습니다.";
+    bodyweightError.value = formatClientError("체중 설정 조회 실패", error);
   }
 }
 
@@ -158,7 +256,7 @@ async function saveBodyweight(): Promise<void> {
     const payload = await updateBodyweight(Number(bodyweightKg.value));
     bodyweightKg.value = payload.bodyweight_kg;
   } catch (error) {
-    bodyweightError.value = error instanceof Error ? error.message : "체중 설정 저장 중 오류가 발생했습니다.";
+    bodyweightError.value = formatClientError("체중 설정 저장 실패", error);
   } finally {
     bodyweightSaving.value = false;
   }
@@ -180,7 +278,7 @@ async function saveAlias(): Promise<void> {
     canonicalName.value = "";
     await refreshAliases();
   } catch (error) {
-    aliasError.value = error instanceof Error ? error.message : "alias 저장 중 오류가 발생했습니다.";
+    aliasError.value = formatClientError("Alias 저장 실패", error);
   } finally {
     aliasSaving.value = false;
   }
@@ -192,7 +290,7 @@ async function removeAlias(id: string): Promise<void> {
     await deleteExerciseAlias(id);
     await refreshAliases();
   } catch (error) {
-    aliasError.value = error instanceof Error ? error.message : "alias 삭제 중 오류가 발생했습니다.";
+    aliasError.value = formatClientError("Alias 삭제 실패", error);
   }
 }
 
@@ -206,7 +304,7 @@ async function resetAll(): Promise<void> {
     await resetSessions();
     await refresh();
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "세션 초기화 중 오류가 발생했습니다.";
+    errorMessage.value = formatClientError("세션 초기화 실패", error);
   } finally {
     resetting.value = false;
   }
@@ -216,5 +314,12 @@ onMounted(() => {
   void refresh();
   void refreshBodyweight();
   void refreshAliases();
+});
+
+onUnmounted(() => {
+  if (cooldownTimer) {
+    clearInterval(cooldownTimer);
+    cooldownTimer = null;
+  }
 });
 </script>

@@ -1,0 +1,130 @@
+name: PR Governance
+
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+
+jobs:
+  pr-template-check:
+    name: PR Template Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR body sections
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request?.body || "";
+            const isDraft = Boolean(context.payload.pull_request?.draft);
+            const requiredSections = [
+              "## 변경 요약",
+              "## 배경 / 문제",
+              "## 검증",
+              "## 체크리스트",
+              "## 롤백 계획"
+            ];
+
+            const splitLines = (markdown) => markdown.split(/\r?\n/);
+            const hasHeading = (markdown, heading) => splitLines(markdown).some((line) => line.trim() === heading);
+            const getSectionBody = (markdown, heading) => {
+              const lines = splitLines(markdown);
+              const headingIndex = lines.findIndex((line) => line.trim() === heading);
+              if (headingIndex < 0) {
+                return "";
+              }
+
+              const sectionLines = [];
+              for (let i = headingIndex + 1; i < lines.length; i += 1) {
+                if (/^##\s+/.test(lines[i])) {
+                  break;
+                }
+                sectionLines.push(lines[i]);
+              }
+              return sectionLines.join("\n").trim();
+            };
+
+            const missing = requiredSections.filter((section) => !hasHeading(body, section));
+            if (missing.length > 0) {
+              core.setFailed(
+                `PR 본문에 필수 섹션이 누락되었습니다: ${missing.join(", ")}`
+              );
+              return;
+            }
+
+            const checklistSection = getSectionBody(body, "## 체크리스트");
+            const verificationSection = getSectionBody(body, "## 검증");
+
+            const requiredChecks = [
+              "Cloudflare API 타입체크 통과",
+              "Cloudflare API 테스트 통과",
+              "Frontend 타입체크 통과",
+              "Frontend 빌드 통과"
+            ];
+
+            const checkboxStatus = requiredChecks.map((label) => {
+              const regex = new RegExp(`^- \\[( |x|X)\\] .*${label}.*$`, "m");
+              const match = checklistSection.match(regex);
+              if (!match) {
+                return { label, exists: false, checked: false };
+              }
+              const checked = /^\- \[(x|X)\]/.test(match[0]);
+              return { label, exists: true, checked };
+            });
+
+            const missingChecklistLines = checkboxStatus.filter((item) => !item.exists).map((item) => item.label);
+            if (missingChecklistLines.length > 0) {
+              core.setFailed(`체크리스트 라인이 누락되었습니다: ${missingChecklistLines.join(", ")}`);
+              return;
+            }
+
+            if (!isDraft) {
+              const unchecked = checkboxStatus.filter((item) => !item.checked).map((item) => item.label);
+              if (unchecked.length > 0) {
+                core.setFailed(`Ready for review PR에서는 아래 항목을 체크([x])해야 합니다: ${unchecked.join(", ")}`);
+                return;
+              }
+            }
+
+            const requiredCommandMentions = [
+              "npm run typecheck",
+              "npm test",
+              "npm run build"
+            ];
+            const missingCommands = requiredCommandMentions.filter(
+              (command) => !verificationSection.includes(command)
+            );
+            if (missingCommands.length > 0) {
+              core.setFailed(`검증 섹션에 실행 명령이 부족합니다: ${missingCommands.join(", ")}`);
+              return;
+            }
+
+            const verificationResultRules = [
+              {
+                label: "cloudflare-api typecheck 결과",
+                regex: /^\s*-\s*`cloudflare-api`:\s*`npm run typecheck`\s*(→|->)\s*(✅|통과|성공|passed|success)/im
+              },
+              {
+                label: "cloudflare-api test 결과",
+                regex: /^\s*-\s*`cloudflare-api`:\s*`npm test`\s*(→|->)\s*(✅|통과|성공|passed|success)/im
+              },
+              {
+                label: "frontend typecheck 결과",
+                regex: /^\s*-\s*`frontend`:\s*`npm run typecheck`\s*(→|->)\s*(✅|통과|성공|passed|success)/im
+              },
+              {
+                label: "frontend build 결과",
+                regex: /^\s*-\s*`frontend`:\s*`npm run build`\s*(→|->)\s*(✅|통과|성공|passed|success)/im
+              }
+            ];
+
+            const missingResultLines = verificationResultRules
+              .filter((rule) => !rule.regex.test(verificationSection))
+              .map((rule) => rule.label);
+            if (missingResultLines.length > 0) {
+              core.setFailed(
+                `검증 섹션에 실행 결과 표기가 부족합니다: ${missingResultLines.join(", ")}`
+              );
+            }

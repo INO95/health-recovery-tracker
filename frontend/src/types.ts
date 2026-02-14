@@ -124,3 +124,9 @@ export type RecoverySettingsResponse = {
 export type BodyweightResponse = {
   bodyweight_kg: number;
 };
+
+export type ApiErrorResponse = {
+  detail: string;
+  code?: string;
+  request_id?: string;
+};

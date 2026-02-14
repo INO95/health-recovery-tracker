@@ -104,6 +104,7 @@ import { ref, watch } from "vue";
 import { createWorker } from "tesseract.js";
 import { getApiBaseUrl, normalizeOcrText, setApiBaseUrl, uploadScreenshot } from "../api/client";
 import type { UploadResponse } from "../types";
+import { formatClientError } from "../utils/apiError";
 import {
   buildNormalizedWorkoutText,
   parseNormalizedWorkoutText,
@@ -164,7 +165,7 @@ async function runOcr(): Promise<void> {
       errorMessage.value = "OCR 텍스트를 추출하지 못했습니다. 텍스트를 직접 입력해 주세요.";
     }
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "OCR 실행 중 오류가 발생했습니다.";
+    errorMessage.value = formatClientError("OCR 실행 실패", error);
   } finally {
     await worker.terminate();
     ocrLoading.value = false;
@@ -192,7 +193,7 @@ async function runAiNormalize(): Promise<void> {
       aiSummary.value += `, warnings=${normalized.warnings.join(",")}`;
     }
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "AI 정리 중 오류가 발생했습니다.";
+    errorMessage.value = formatClientError("AI 정리 실패", error);
   } finally {
     aiLoading.value = false;
   }
@@ -220,7 +221,7 @@ async function uploadFile(): Promise<void> {
       parserVersion: "cf-parser-v1",
     });
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "업로드 중 오류가 발생했습니다.";
+    errorMessage.value = formatClientError("업로드 실패", error);
   } finally {
     loading.value = false;
   }
